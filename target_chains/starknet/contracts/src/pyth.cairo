@@ -9,7 +9,10 @@ pub use pyth::{Event, PriceFeedUpdateEvent};
 pub trait IPyth<T> {
     fn get_price_unsafe(self: @T, price_id: u256) -> Result<Price, GetPriceUnsafeError>;
     fn get_ema_price_unsafe(self: @T, price_id: u256) -> Result<Price, GetPriceUnsafeError>;
-    fn set_data_sources(ref self: T, sources: Array<DataSource>) -> Result<(), SetDataSourcesError>;
+    fn set_data_sources(
+        ref self: T, sources: Array<DataSource>
+    ) -> Result<(), GovernanceActionError>;
+    fn set_fee(ref self: T, single_update_fee: u256) -> Result<(), GovernanceActionError>;
     fn update_price_feeds(ref self: T, data: ByteArray) -> Result<(), UpdatePriceFeedsError>;
 }
 
@@ -35,14 +38,13 @@ impl GetPriceUnsafeErrorIntoFelt252 of Into<GetPriceUnsafeError, felt252> {
     }
 }
 
-
 #[derive(Copy, Drop, Debug, Serde, PartialEq)]
-pub enum SetDataSourcesError {
+pub enum GovernanceActionError {
     AccessDenied,
 }
 
-pub impl SetDataSourcesErrorUnwrapWithFelt252<T> of UnwrapWithFelt252<T, SetDataSourcesError> {
-    fn unwrap_with_felt252(self: Result<T, SetDataSourcesError>) -> T {
+pub impl GovernanceActionErrorUnwrapWithFelt252<T> of UnwrapWithFelt252<T, GovernanceActionError> {
+    fn unwrap_with_felt252(self: Result<T, GovernanceActionError>) -> T {
         match self {
             Result::Ok(v) => v,
             Result::Err(err) => core::panic_with_felt252(err.into()),
@@ -50,10 +52,10 @@ pub impl SetDataSourcesErrorUnwrapWithFelt252<T> of UnwrapWithFelt252<T, SetData
     }
 }
 
-impl SetDataSourcesErrorIntoFelt252 of Into<SetDataSourcesError, felt252> {
-    fn into(self: SetDataSourcesError) -> felt252 {
+impl GovernanceActionErrorIntoFelt252 of Into<GovernanceActionError, felt252> {
+    fn into(self: GovernanceActionError) -> felt252 {
         match self {
-            SetDataSourcesError::AccessDenied => 'access denied',
+            GovernanceActionError::AccessDenied => 'access denied',
         }
     }
 }
@@ -64,6 +66,7 @@ pub enum UpdatePriceFeedsError {
     Wormhole: super::wormhole::ParseAndVerifyVmError,
     InvalidUpdateData,
     InvalidUpdateDataSource,
+    InsufficientFee,
 }
 
 pub impl UpdatePriceFeedsErrorUnwrapWithFelt252<T> of UnwrapWithFelt252<T, UpdatePriceFeedsError> {
@@ -82,6 +85,7 @@ impl UpdatePriceFeedsErrorIntoFelt252 of Into<UpdatePriceFeedsError, felt252> {
             UpdatePriceFeedsError::Wormhole(err) => err.into(),
             UpdatePriceFeedsError::InvalidUpdateData => 'invalid update data',
             UpdatePriceFeedsError::InvalidUpdateDataSource => 'invalid update data source',
+            UpdatePriceFeedsError::InsufficientFee => 'insufficient fee',
         }
     }
 }
@@ -116,16 +120,17 @@ mod pyth {
     use pyth::reader::{Reader, ReaderImpl};
     use pyth::byte_array::{ByteArray, ByteArrayImpl};
     use core::panic_with_felt252;
-    use core::starknet::{ContractAddress, get_caller_address};
+    use core::starknet::{ContractAddress, get_caller_address, get_execution_info};
     use pyth::wormhole::{IWormholeDispatcher, IWormholeDispatcherTrait};
     use super::{
-        DataSource, UpdatePriceFeedsError, PriceInfo, SetDataSourcesError, Price,
+        DataSource, UpdatePriceFeedsError, PriceInfo, GovernanceActionError, Price,
         GetPriceUnsafeError
     };
     use pyth::merkle_tree::{read_and_verify_proof, MerkleVerificationError};
     use pyth::hash::{Hasher, HasherImpl};
     use core::fmt::{Debug, Formatter};
     use pyth::util::{u64_as_i64, u32_as_i32};
+    use openzeppelin::token::erc20::interface::{IERC20CamelDispatcherTrait, IERC20CamelDispatcher};
 
     // Stands for PNAU (Pyth Network Accumulator Update)
     const ACCUMULATOR_MAGIC: u32 = 0x504e4155;
@@ -220,6 +225,8 @@ mod pyth {
     #[storage]
     struct Storage {
         wormhole_address: ContractAddress,
+        fee_contract_address: ContractAddress,
+        single_update_fee: u256,
         owner: ContractAddress,
         data_sources: LegacyMap<usize, DataSource>,
         num_data_sources: usize,
@@ -233,10 +240,14 @@ mod pyth {
         ref self: ContractState,
         owner: ContractAddress,
         wormhole_address: ContractAddress,
+        fee_contract_address: ContractAddress,
+        single_update_fee: u256,
         data_sources: Array<DataSource>
     ) {
         self.owner.write(wormhole_address);
         self.wormhole_address.write(wormhole_address);
+        self.fee_contract_address.write(fee_contract_address);
+        self.single_update_fee.write(single_update_fee);
         write_data_sources(ref self, data_sources);
     }
 
@@ -308,11 +319,21 @@ mod pyth {
 
         fn set_data_sources(
             ref self: ContractState, sources: Array<DataSource>
-        ) -> Result<(), SetDataSourcesError> {
+        ) -> Result<(), GovernanceActionError> {
             if self.owner.read() != get_caller_address() {
-                return Result::Err(SetDataSourcesError::AccessDenied);
+                return Result::Err(GovernanceActionError::AccessDenied);
             }
             write_data_sources(ref self, sources);
+            Result::Ok(())
+        }
+
+        fn set_fee(
+            ref self: ContractState, single_update_fee: u256
+        ) -> Result<(), GovernanceActionError> {
+            if self.owner.read() != get_caller_address() {
+                return Result::Err(GovernanceActionError::AccessDenied);
+            }
+            self.single_update_fee.write(single_update_fee);
             Result::Ok(())
         }
 
@@ -373,6 +394,20 @@ mod pyth {
             let root_digest = payload_reader.read_u160().map_err()?;
 
             let num_updates = reader.read_u8().map_err()?;
+
+            let total_fee = get_total_fee(ref self, num_updates);
+            let fee_contract = IERC20CamelDispatcher {
+                contract_address: self.fee_contract_address.read()
+            };
+            let execution_info = get_execution_info().unbox();
+            let caller = execution_info.caller_address;
+            let contract = execution_info.contract_address;
+            if fee_contract.allowance(caller, contract) < total_fee {
+                return Result::Err(UpdatePriceFeedsError::InsufficientFee);
+            }
+            if !fee_contract.transferFrom(caller, contract, total_fee) {
+                return Result::Err(UpdatePriceFeedsError::InsufficientFee);
+            }
 
             let mut i = 0;
             let mut result = Result::Ok(());
@@ -449,5 +484,9 @@ mod pyth {
             };
             self.emit(event);
         }
+    }
+
+    fn get_total_fee(ref self: ContractState, num_updates: u8) -> u256 {
+        self.single_update_fee.read() * num_updates.into()
     }
 }
